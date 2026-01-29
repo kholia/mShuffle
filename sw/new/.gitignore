@@ -1,0 +1,25 @@
+# Copyright 2023 jacqueline <me@jacqueline.id.au>
+#
+# SPDX-License-Identifier: CC0-1.0
+
+.cache/
+.clangd
+.helix/
+build/
+build.clang/
+sdkconfig
+sdkconfig.old
+.vscode
+compile_commands.json
+warnings.txt
+.DS_Store
+
+doc/
+
+test/build/
+test/dependencies.lock
+test/sdkconfig
+sdkconfig.bak
+*.ignore
+
+/sdkconfig.local

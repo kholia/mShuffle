@@ -1,0 +1,187 @@
+/*
+ * Copyright 2023 jacqueline <me@jacqueline.id.au>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+#pragma once
+
+#include <list>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <vector>
+
+#include "audio/audio_events.hpp"
+#include "cppbor_parse.h"
+#include "database/database.hpp"
+#include "database/track.hpp"
+#include "playlist.hpp"
+#include "tasks.hpp"
+
+namespace audio {
+
+/*
+ * Utility that uses a Miller shuffle to yield well-distributed random indexes
+ * from within a range.
+ */
+class RandomIterator {
+ public:
+  RandomIterator();
+  RandomIterator(size_t size);
+
+  auto current() const -> size_t;
+
+  auto next(bool repeat) -> bool;
+  auto prev() -> void;
+
+  // Note resizing has the side-effect of restarting iteration.
+  auto resize(size_t) -> void;
+
+  auto seed() -> size_t& { return seed_; }
+  auto pos() -> size_t& { return pos_; }
+  auto size() -> size_t& { return size_; }
+
+ private:
+  size_t seed_;
+  size_t pos_;
+  size_t size_;
+};
+
+/*
+ * Owns and manages a complete view of the playback queue. Includes the
+ * currently playing track, a truncated list of previously played tracks, and
+ * all future tracks that have been queued.
+ *
+ * In order to not use all of our memory, this class deals strictly with track
+ * ids. Consumers that need more data than this should fetch it from the
+ * database.
+ *
+ * Instances of this class are broadly safe to use from multiple tasks; each
+ * method represents an atomic operation. No guarantees are made about
+ * consistency between calls however.
+ */
+class TrackQueue {
+ public:
+  TrackQueue(tasks::WorkerPool& bg_worker, database::Handle db, drivers::NvsStorage& nvs);
+
+  /* Returns the currently playing track. */
+  using TrackItem =
+      std::variant<std::string, database::TrackId, std::monostate>;
+  auto current() const -> TrackItem;
+
+  auto currentPosition() const -> size_t;
+  auto currentPosition(size_t position) -> bool;
+  auto totalSize() const -> size_t;
+  auto open() -> bool;
+  auto close() -> void;
+  auto openPlaylist(const std::string& playlist_file,
+                    bool notify = true) -> bool;
+  auto playFromPosition(const std::string& filepath, uint32_t position) -> void;
+
+  using Item =
+      std::variant<database::TrackId, database::TrackIterator, std::string>;
+  auto append(Item i) -> void;
+
+  auto updateShuffler(bool andUpdatePosition) -> void;
+
+  /*
+   * Advances to the next track in the queue, placing the current track at the
+   * front of the 'played' queue.
+   */
+  auto next() -> void;
+  auto previous() -> void;
+
+  /*
+   * Called when the current track finishes
+   */
+  auto finish() -> void;
+
+  /*
+   * Removes all tracks from all queues, and stops any currently playing track.
+   */
+  auto clear() -> void;
+
+  auto random(bool) -> void;
+  auto random() const -> bool;
+
+  enum RepeatMode {
+    OFF = 0,
+    REPEAT_TRACK = 1,
+    REPEAT_QUEUE = 2,
+  };
+
+  auto repeatMode(RepeatMode mode) -> void;
+  auto repeatMode() const -> RepeatMode;
+
+  auto isLoading() const -> bool;
+  auto isReady() const -> bool;
+
+  auto serialise() -> std::string;
+  auto deserialise(const std::string&) -> void;
+
+  // Cannot be copied or moved.
+  TrackQueue(const TrackQueue&) = delete;
+  TrackQueue& operator=(const TrackQueue&) = delete;
+
+ private:
+  auto next(QueueUpdate::Reason r) -> void;
+  auto goTo(size_t position) -> void;
+  auto getFilepath(database::TrackId id) -> std::optional<std::string>;
+  auto appendAsync(database::TrackIterator i, bool was_empty) -> void;
+
+  mutable std::shared_mutex mutex_;
+
+  tasks::WorkerPool& bg_worker_;
+  database::Handle db_;
+  drivers::NvsStorage& nvs_;
+
+  MutablePlaylist playlist_;
+  std::optional<Playlist> opened_playlist_;
+
+  size_t position_;
+
+  std::optional<RandomIterator> shuffle_;
+  RepeatMode repeatMode_;
+
+  std::atomic<bool> cancel_appending_async_;
+  std::atomic<bool> appending_async_;
+  std::list<database::TrackIterator> pending_async_iterators_;
+
+  bool loading_;
+  bool ready_;
+
+  class QueueParseClient : public cppbor::ParseClient {
+   public:
+    QueueParseClient(TrackQueue& queue);
+
+    ParseClient* item(std::unique_ptr<cppbor::Item>& item,
+                      const uint8_t* hdrBegin,
+                      const uint8_t* valueBegin,
+                      const uint8_t* end) override;
+
+    ParseClient* itemEnd(std::unique_ptr<cppbor::Item>& item,
+                         const uint8_t* hdrBegin,
+                         const uint8_t* valueBegin,
+                         const uint8_t* end) override;
+
+    void error(const uint8_t* position,
+               const std::string& errorMessage) override {}
+
+   private:
+    TrackQueue& queue_;
+
+    enum class State {
+      kInit,
+      kRoot,
+      kMetadata,
+      kShuffle,
+      kFinished,
+    };
+    State state_;
+    size_t i_;
+    size_t position_to_set_;
+  };
+};
+
+}  // namespace audio

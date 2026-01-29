@@ -1,0 +1,150 @@
+/*
+ * Copyright 2023 jacqueline <me@jacqueline.id.au>
+ *
+ * SPDX-License-Identifier: GPL-3.0-only
+ */
+
+#pragma once
+
+#include <stdint.h>
+
+#include <atomic>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <tuple>
+#include <utility>
+
+#include "driver/i2c.h"
+#include "esp_check.h"
+#include "esp_err.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+
+namespace drivers {
+
+/**
+ * Wrapper for interfacing with the PCA8575 GPIO expander. Includes basic
+ * low-level pin setting methods, as well as higher level convenience functions
+ * for reading, writing, and atomically interacting with the SPI chip select
+ * pins.
+ *
+ * Each method of this class can be called safely from any thread, and all
+ * updates are guaranteed to be atomic. Any access to chip select related pins
+ * should be done whilst holding `cs_lock` (preferably via the helper methods).
+ */
+class IGpios {
+ public:
+  virtual ~IGpios() {}
+
+  /* Maps each pin of the expander to its number in a `pack`ed uint16. */
+  enum class Pin {
+    // Port A
+    kSdMuxSwitch = 0,
+    kSdMuxDisable = 1,
+    kKeyUp = 2,
+    kKeyDown = 3,
+    kKeyLock = 4,
+    kDisplayEnable = 5,
+    // 6 is unused
+    kSdPowerEnable = 7,
+
+    // Port B
+    kPhoneDetect = 8,
+    kAmplifierEnable = 9,
+    kSdCardDetect = 10,
+    kAmplifierUnmuteLegacy = 11,
+    kAmplifierMute = 12,
+    // 13 through 15 are unused
+  };
+
+  /* Nicer value names for use with kSdMuxSwitch. */
+  enum SdTarget {
+    SD_MUX_ESP = 0,
+    SD_MUX_SAMD = 1,
+  };
+
+  /*
+   * Sets a single specific pin to the given value. `true` corresponds to
+   * HIGH, and `false` corresponds to LOW.
+   *
+   * This function will block until the pin has changed level.
+   */
+  virtual auto WriteSync(Pin, bool) -> bool = 0;
+
+  /*
+   * Returns the most recently cached value of the given pin.
+   */
+  virtual auto Get(Pin) const -> bool = 0;
+
+  virtual auto IsLocked() const -> bool = 0;
+
+  /*
+   * Enables or disable the SD mux. When the mux is disabled, the SD card is
+   * isolated from the rest of the SPI bus.
+   */
+  virtual auto SdMuxEnable(bool en) -> void = 0;
+
+  /* Switches whether the SD card is connected to the ESP32 or SAMD21. */
+  virtual auto SdMuxTarget(SdTarget target) -> void = 0;
+};
+
+class Gpios : public IGpios {
+ public:
+  static auto Create(bool invert_lock_switch) -> Gpios*;
+  ~Gpios();
+
+  /*
+   * Sets a single specific pin to the given value. `true` corresponds to
+   * HIGH, and `false` corresponds to LOW.
+   *
+   * Calls to this method will be buffered in memory until a call to `Write()`
+   * is made.
+   */
+  auto WriteSync(Pin, bool) -> bool override;
+
+  auto ShouldRead() -> bool;
+
+  virtual auto WriteBuffered(Pin, bool) -> void;
+
+  /**
+   * Sets the ports on the GPIO expander to the values currently represented
+   * in `ports`.
+   */
+  auto Flush(void) -> bool;
+
+  auto Get(Pin) const -> bool override;
+
+  auto IsLocked() const -> bool override;
+
+  /**
+   * Reads from the GPIO expander, populating `inputs` with the most recent
+   * values.
+   */
+  auto Read(void) -> bool;
+
+  auto SdMuxEnable(bool en) -> void override;
+  auto SdMuxTarget(SdTarget target) -> void override;
+
+  auto SdMuxTarget() -> SdTarget;
+
+  // Not copyable or movable. There should usually only ever be once instance
+  // of this class, and that instance will likely have a static lifetime.
+  Gpios(const Gpios&) = delete;
+  Gpios& operator=(const Gpios&) = delete;
+
+ private:
+  Gpios(bool invert_lock);
+
+  std::atomic<uint16_t> ports_;
+  std::atomic<uint16_t> inputs_;
+  const bool invert_lock_switch_;
+  bool has_written_;
+
+  std::mutex mux_mutex_;
+  bool mux_en_;
+};
+
+}  // namespace drivers
